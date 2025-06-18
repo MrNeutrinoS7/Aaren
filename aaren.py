@@ -1,5 +1,56 @@
 import torch
 import torch.nn as nn
+import math
+import numpy as np
+from numba import cuda
+
+    
+@cuda.jit
+def update_kernel(i : int, N : int, temporary : np.array, output : np.array):
+    j = cuda.grid(1)
+    if j < N-1:
+        if j < math.exp(i):
+            temporary[j] = output[j]
+        else:
+            m_i = output[j][0]
+            u_i = output[j][1]
+            w_i = output[j][2]
+            
+            m_j = output[j-int(math.exp(i))][0]
+            u_j = output[j-int(math.exp(i))][1]
+            w_j = output[j-int(math.exp(i))][2]
+            
+            m_f = m_i if m_i > m_j else m_j
+            exp_diff_i = math.exp(m_i - m_f)
+            exp_diff_j = math.exp(m_j - m_f)
+            
+            u_f = u_i * exp_diff_i + u_j * exp_diff_j
+            # Set scalar fields
+            temporary[j][0] = m_f
+            temporary[j][1] = u_f
+            
+            # Set vector elements individually
+            for d in range(len(w_i)):
+                temporary[j][2][d] = w_i[d] * exp_diff_i + w_j[d] * exp_diff_j
+            
+            
+def parallel_forward(s : np.array, V : np.array) -> np.array:
+    ttype = np.dtype([
+    ('scalar_float', np.float32),
+    ('scalar_int', np.int32),
+    ('vector', np.float32, (len(V[0]),))  
+    ])
+    N = len(s)
+    neutral = (np.float32(0.0), np.int32(0), np.zeros(len(V[0]), dtype=np.float32))
+    temporary = np.array([neutral for _ in range(N)], dtype=ttype)
+    output = np.array([(s_i,1,v_i) for s_i,v_i in zip(s, V)],dtype=ttype)
+    for i in range(0,int(math.log(N))):
+        threads_per_block = 256
+        blocks_per_grid = int((N + threads_per_block - 1) // threads_per_block)
+        update_kernel[blocks_per_grid,threads_per_block](i, N, temporary, output)
+        output = temporary
+    return output
+
 
 class Aaren(nn.Module):
     def __init__(self, d_model):
@@ -12,17 +63,19 @@ class Aaren(nn.Module):
         m_i, u_i, w_i = tuple_i
         m_j, u_j, w_j = tuple_j
         
-        m_f = torch.maximum(m_i, m_j)
-        exp_diff_i = torch.exp(m_i - m_f)
-        exp_diff_j = torch.exp(m_j - m_f)
+        m_f = max(m_i, m_j)
+        exp_diff_i = math.exp(m_i - m_f)
+        exp_diff_j = math.exp(m_j - m_f)
         
         u_f = u_i * exp_diff_i + u_j * exp_diff_j
         w_f = w_i * exp_diff_i + w_j * exp_diff_j
         
         return (m_f, u_f, w_f)
     
-    def forward(self, K, V, mode=0):
-        s = torch.matmul(K, self.q)
+        
+    def forward(self, K : torch.tensor, V : torch.tensor, mode=0):
+        s = [torch.dot(k,self.q) for k in K]
+        s = torch.tensor(s)
         if mode == 0:
             output = torch.empty_like(V)
             m_prev = torch.tensor(float('-inf'), device=s.device)
@@ -39,61 +92,13 @@ class Aaren(nn.Module):
                 
                 output[i] = w_curr / u_curr
                 m_prev, u_prev, w_prev = m_curr, u_curr, w_curr
-                
             return output
         elif mode == 1:
-            return torch.zeros(self.d_model,self.d_model)
-            #return self.parallel_forward(s, V)
-            #I don't know how to implement parralel scan correctly
-            #I tried but it had even worse performance than the iterative implementation, bruh
+            s = s.numpy()
+            V = V.numpy()
+            return torch.tensor(parallel_forward(s, V))
         else:
             raise ValueError("Invalid mode")
-            
 
-class AtteRNNtion(nn.Module):
-    def __init__(self, d_model, num_layers=4):
-        super().__init__()
-        self.d_model = d_model
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
-        self.layers = nn.ModuleList([Aaren(d_model) for _ in range(num_layers)])
-        self.norm = nn.LayerNorm(d_model)
-        
-    def forward(self, X, mode=0):
-        K = self.W_k(X)
-        V = self.W_v(X)
-        for layer in self.layers:
-            H = layer(K, V, mode)
-            K = self.W_k(H)
-            V = self.W_v(H)  
-        return self.norm(H)
-
-    def fit(self, dataloader, epochs=10, lr=1e-4, clip_grad=1.0):
-        """Training loop that handles device placement and gradient clipping."""
-        device = next(self.parameters()).device
-        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss()
-        
-        for epoch in range(epochs):
-            self.train()
-            total_loss = 0
-            
-            for batch in dataloader:
-                # Auto-detect batch type (single tensor or tuple)
-                if isinstance(batch, (list, tuple)):
-                    x, y = batch[0].to(device), batch[1].to(device)
-                else:
-                    x, y = batch.to(device), None  # Assume autoencoder
-                
-                optimizer.zero_grad()
-                logits = self(x, mode=1)  # Parallel mode for training
-                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1)) if y else logits.mean()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.parameters(), clip_grad)
-                optimizer.step()
-                
-                total_loss += loss.item()
-            
-            print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(dataloader):.4f}")
             
 
